@@ -53,12 +53,6 @@
     <ClCompile Include="MinHookLib.cpp">
       <Filter>소스 파일</Filter>
     </ClCompile>
-    <ClCompile Include="minhook\src\buffer.c">
-      <Filter>MinHook</Filter>
-    </ClCompile>
-    <ClCompile Include="minhook\src\trampoline.c">
-      <Filter>MinHook</Filter>
-    </ClCompile>
     <ClCompile Include="minhook\src\hde\hde32.c">
       <Filter>MinHook\hde</Filter>
     </ClCompile>

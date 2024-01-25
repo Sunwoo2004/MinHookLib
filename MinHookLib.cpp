@@ -892,3 +892,577 @@ const char* WINAPI MH_StatusToString(MH_STATUS status)
 
     return "(unknown)";
 }
+
+
+
+#include <windows.h>
+
+#if defined(_MSC_VER) && !defined(MINHOOK_DISABLE_INTRINSICS)
+#define ALLOW_INTRINSICS
+#include <intrin.h>
+#endif
+
+#ifndef ARRAYSIZE
+#define ARRAYSIZE(A) (sizeof(A)/sizeof((A)[0]))
+#endif
+
+#if defined(_M_X64) || defined(__x86_64__)
+#include "minhook/src/hde/hde64.h"
+typedef hde64s HDE;
+#define HDE_DISASM(code, hs) hde64_disasm(code, hs)
+#else
+#include "minhook/src/hde/hde32.h"
+typedef hde32s HDE;
+#define HDE_DISASM(code, hs) hde32_disasm(code, hs)
+#endif
+
+// Maximum size of a trampoline function.
+#if defined(_M_X64) || defined(__x86_64__)
+#define TRAMPOLINE_MAX_SIZE (MEMORY_SLOT_SIZE - sizeof(JMP_ABS))
+#else
+#define TRAMPOLINE_MAX_SIZE MEMORY_SLOT_SIZE
+#endif
+
+//-------------------------------------------------------------------------
+static BOOL IsCodePadding(LPBYTE pInst, UINT size)
+{
+    UINT i;
+
+    if (pInst[0] != 0x00 && pInst[0] != 0x90 && pInst[0] != 0xCC)
+        return FALSE;
+
+    for (i = 1; i < size; ++i)
+    {
+        if (pInst[i] != pInst[0])
+            return FALSE;
+    }
+    return TRUE;
+}
+
+//-------------------------------------------------------------------------
+BOOL CreateTrampolineFunction(PTRAMPOLINE ct)
+{
+#if defined(_M_X64) || defined(__x86_64__)
+    CALL_ABS call = {
+        0xFF, 0x15, 0x00000002, // FF15 00000002: CALL [RIP+8]
+        0xEB, 0x08,             // EB 08:         JMP +10
+        0x0000000000000000ULL   // Absolute destination address
+    };
+    JMP_ABS jmp = {
+        0xFF, 0x25, 0x00000000, // FF25 00000000: JMP [RIP+6]
+        0x0000000000000000ULL   // Absolute destination address
+    };
+    JCC_ABS jcc = {
+        0x70, 0x0E,             // 7* 0E:         J** +16
+        0xFF, 0x25, 0x00000000, // FF25 00000000: JMP [RIP+6]
+        0x0000000000000000ULL   // Absolute destination address
+    };
+#else
+    CALL_REL call = {
+        0xE8,                   // E8 xxxxxxxx: CALL +5+xxxxxxxx
+        0x00000000              // Relative destination address
+    };
+    JMP_REL jmp = {
+        0xE9,                   // E9 xxxxxxxx: JMP +5+xxxxxxxx
+        0x00000000              // Relative destination address
+    };
+    JCC_REL jcc = {
+        0x0F, 0x80,             // 0F8* xxxxxxxx: J** +6+xxxxxxxx
+        0x00000000              // Relative destination address
+    };
+#endif
+
+    UINT8     oldPos = 0;
+    UINT8     newPos = 0;
+    ULONG_PTR jmpDest = 0;     // Destination address of an internal jump.
+    BOOL      finished = FALSE; // Is the function completed?
+#if defined(_M_X64) || defined(__x86_64__)
+    UINT8     instBuf[16];
+#endif
+
+    ct->patchAbove = FALSE;
+    ct->nIP = 0;
+
+    do
+    {
+        HDE       hs;
+        UINT      copySize;
+        LPVOID    pCopySrc;
+        ULONG_PTR pOldInst = (ULONG_PTR)ct->pTarget + oldPos;
+        ULONG_PTR pNewInst = (ULONG_PTR)ct->pTrampoline + newPos;
+
+        copySize = HDE_DISASM((LPVOID)pOldInst, &hs);
+        if (hs.flags & F_ERROR)
+            return FALSE;
+
+        pCopySrc = (LPVOID)pOldInst;
+        if (oldPos >= sizeof(JMP_REL))
+        {
+            // The trampoline function is long enough.
+            // Complete the function with the jump to the target function.
+#if defined(_M_X64) || defined(__x86_64__)
+            jmp.address = pOldInst;
+#else
+            jmp.operand = (UINT32)(pOldInst - (pNewInst + sizeof(jmp)));
+#endif
+            pCopySrc = &jmp;
+            copySize = sizeof(jmp);
+
+            finished = TRUE;
+        }
+#if defined(_M_X64) || defined(__x86_64__)
+        else if ((hs.modrm & 0xC7) == 0x05)
+        {
+            // Instructions using RIP relative addressing. (ModR/M = 00???101B)
+
+            // Modify the RIP relative address.
+            PUINT32 pRelAddr;
+
+            // Avoid using memcpy to reduce the footprint.
+#ifndef ALLOW_INTRINSICS
+            memcpy(instBuf, (LPBYTE)pOldInst, copySize);
+#else
+            __movsb(instBuf, (LPBYTE)pOldInst, copySize);
+#endif
+            pCopySrc = instBuf;
+
+            // Relative address is stored at (instruction length - immediate value length - 4).
+            pRelAddr = (PUINT32)(instBuf + hs.len - ((hs.flags & 0x3C) >> 2) - 4);
+            *pRelAddr
+                = (UINT32)((pOldInst + hs.len + (INT32)hs.disp.disp32) - (pNewInst + hs.len));
+
+            // Complete the function if JMP (FF /4).
+            if (hs.opcode == 0xFF && hs.modrm_reg == 4)
+                finished = TRUE;
+        }
+#endif
+        else if (hs.opcode == 0xE8)
+        {
+            // Direct relative CALL
+            ULONG_PTR dest = pOldInst + hs.len + (INT32)hs.imm.imm32;
+#if defined(_M_X64) || defined(__x86_64__)
+            call.address = dest;
+#else
+            call.operand = (UINT32)(dest - (pNewInst + sizeof(call)));
+#endif
+            pCopySrc = &call;
+            copySize = sizeof(call);
+        }
+        else if ((hs.opcode & 0xFD) == 0xE9)
+        {
+            // Direct relative JMP (EB or E9)
+            ULONG_PTR dest = pOldInst + hs.len;
+
+            if (hs.opcode == 0xEB) // isShort jmp
+                dest += (INT8)hs.imm.imm8;
+            else
+                dest += (INT32)hs.imm.imm32;
+
+            // Simply copy an internal jump.
+            if ((ULONG_PTR)ct->pTarget <= dest
+                && dest < ((ULONG_PTR)ct->pTarget + sizeof(JMP_REL)))
+            {
+                if (jmpDest < dest)
+                    jmpDest = dest;
+            }
+            else
+            {
+#if defined(_M_X64) || defined(__x86_64__)
+                jmp.address = dest;
+#else
+                jmp.operand = (UINT32)(dest - (pNewInst + sizeof(jmp)));
+#endif
+                pCopySrc = &jmp;
+                copySize = sizeof(jmp);
+
+                // Exit the function if it is not in the branch.
+                finished = (pOldInst >= jmpDest);
+            }
+        }
+        else if ((hs.opcode & 0xF0) == 0x70
+            || (hs.opcode & 0xFC) == 0xE0
+            || (hs.opcode2 & 0xF0) == 0x80)
+        {
+            // Direct relative Jcc
+            ULONG_PTR dest = pOldInst + hs.len;
+
+            if ((hs.opcode & 0xF0) == 0x70      // Jcc
+                || (hs.opcode & 0xFC) == 0xE0)  // LOOPNZ/LOOPZ/LOOP/JECXZ
+                dest += (INT8)hs.imm.imm8;
+            else
+                dest += (INT32)hs.imm.imm32;
+
+            // Simply copy an internal jump.
+            if ((ULONG_PTR)ct->pTarget <= dest
+                && dest < ((ULONG_PTR)ct->pTarget + sizeof(JMP_REL)))
+            {
+                if (jmpDest < dest)
+                    jmpDest = dest;
+            }
+            else if ((hs.opcode & 0xFC) == 0xE0)
+            {
+                // LOOPNZ/LOOPZ/LOOP/JCXZ/JECXZ to the outside are not supported.
+                return FALSE;
+            }
+            else
+            {
+                UINT8 cond = ((hs.opcode != 0x0F ? hs.opcode : hs.opcode2) & 0x0F);
+#if defined(_M_X64) || defined(__x86_64__)
+                // Invert the condition in x64 mode to simplify the conditional jump logic.
+                jcc.opcode = 0x71 ^ cond;
+                jcc.address = dest;
+#else
+                jcc.opcode1 = 0x80 | cond;
+                jcc.operand = (UINT32)(dest - (pNewInst + sizeof(jcc)));
+#endif
+                pCopySrc = &jcc;
+                copySize = sizeof(jcc);
+            }
+        }
+        else if ((hs.opcode & 0xFE) == 0xC2)
+        {
+            // RET (C2 or C3)
+
+            // Complete the function if not in a branch.
+            finished = (pOldInst >= jmpDest);
+        }
+
+        // Can't alter the instruction length in a branch.
+        if (pOldInst < jmpDest && copySize != hs.len)
+            return FALSE;
+
+        // Trampoline function is too large.
+        if ((newPos + copySize) > TRAMPOLINE_MAX_SIZE)
+            return FALSE;
+
+        // Trampoline function has too many instructions.
+        if (ct->nIP >= ARRAYSIZE(ct->oldIPs))
+            return FALSE;
+
+        ct->oldIPs[ct->nIP] = oldPos;
+        ct->newIPs[ct->nIP] = newPos;
+        ct->nIP++;
+
+        // Avoid using memcpy to reduce the footprint.
+#ifndef ALLOW_INTRINSICS
+        memcpy((LPBYTE)ct->pTrampoline + newPos, pCopySrc, copySize);
+#else
+        __movsb((LPBYTE)ct->pTrampoline + newPos, (LPBYTE)pCopySrc, copySize);
+#endif
+        newPos += copySize;
+        oldPos += hs.len;
+    } while (!finished);
+
+    // Is there enough place for a long jump?
+    if (oldPos < sizeof(JMP_REL)
+        && !IsCodePadding((LPBYTE)ct->pTarget + oldPos, sizeof(JMP_REL) - oldPos))
+    {
+        // Is there enough place for a short jump?
+        if (oldPos < sizeof(JMP_REL_SHORT)
+            && !IsCodePadding((LPBYTE)ct->pTarget + oldPos, sizeof(JMP_REL_SHORT) - oldPos))
+        {
+            return FALSE;
+        }
+
+        // Can we place the long jump above the function?
+        if (!IsExecutableAddress((LPBYTE)ct->pTarget - sizeof(JMP_REL)))
+            return FALSE;
+
+        if (!IsCodePadding((LPBYTE)ct->pTarget - sizeof(JMP_REL), sizeof(JMP_REL)))
+            return FALSE;
+
+        ct->patchAbove = TRUE;
+    }
+
+#if defined(_M_X64) || defined(__x86_64__)
+    // Create a relay function.
+    jmp.address = (ULONG_PTR)ct->pDetour;
+
+    ct->pRelay = (LPBYTE)ct->pTrampoline + newPos;
+    memcpy(ct->pRelay, &jmp, sizeof(jmp));
+#endif
+
+    return TRUE;
+}
+
+// Size of each memory block. (= page size of VirtualAlloc)
+#define MEMORY_BLOCK_SIZE 0x1000
+
+// Max range for seeking a memory block. (= 1024MB)
+#define MAX_MEMORY_RANGE 0x40000000
+
+// Memory protection flags to check the executable address.
+#define PAGE_EXECUTE_FLAGS \
+    (PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)
+
+// Memory slot.
+typedef struct _MEMORY_SLOT
+{
+    union
+    {
+        struct _MEMORY_SLOT* pNext;
+        UINT8 buffer[MEMORY_SLOT_SIZE];
+    };
+} MEMORY_SLOT, * PMEMORY_SLOT;
+
+// Memory block info. Placed at the head of each block.
+typedef struct _MEMORY_BLOCK
+{
+    struct _MEMORY_BLOCK* pNext;
+    PMEMORY_SLOT pFree;         // First element of the free slot list.
+    UINT usedCount;
+} MEMORY_BLOCK, * PMEMORY_BLOCK;
+
+//-------------------------------------------------------------------------
+// Global Variables:
+//-------------------------------------------------------------------------
+
+// First element of the memory block list.
+PMEMORY_BLOCK g_pMemoryBlocks;
+
+//-------------------------------------------------------------------------
+VOID InitializeBuffer(VOID)
+{
+    // Nothing to do for now.
+}
+
+//-------------------------------------------------------------------------
+VOID UninitializeBuffer(VOID)
+{
+    PMEMORY_BLOCK pBlock = g_pMemoryBlocks;
+    g_pMemoryBlocks = NULL;
+
+    while (pBlock)
+    {
+        PMEMORY_BLOCK pNext = pBlock->pNext;
+        VirtualFree(pBlock, 0, MEM_RELEASE);
+        pBlock = pNext;
+    }
+}
+
+//-------------------------------------------------------------------------
+#if defined(_M_X64) || defined(__x86_64__)
+static LPVOID FindPrevFreeRegion(LPVOID pAddress, LPVOID pMinAddr, DWORD dwAllocationGranularity)
+{
+    ULONG_PTR tryAddr = (ULONG_PTR)pAddress;
+
+    // Round down to the allocation granularity.
+    tryAddr -= tryAddr % dwAllocationGranularity;
+
+    // Start from the previous allocation granularity multiply.
+    tryAddr -= dwAllocationGranularity;
+
+    while (tryAddr >= (ULONG_PTR)pMinAddr)
+    {
+        MEMORY_BASIC_INFORMATION mbi;
+        if (VirtualQuery((LPVOID)tryAddr, &mbi, sizeof(mbi)) == 0)
+            break;
+
+        if (mbi.State == MEM_FREE)
+            return (LPVOID)tryAddr;
+
+        if ((ULONG_PTR)mbi.AllocationBase < dwAllocationGranularity)
+            break;
+
+        tryAddr = (ULONG_PTR)mbi.AllocationBase - dwAllocationGranularity;
+    }
+
+    return NULL;
+}
+#endif
+
+//-------------------------------------------------------------------------
+#if defined(_M_X64) || defined(__x86_64__)
+static LPVOID FindNextFreeRegion(LPVOID pAddress, LPVOID pMaxAddr, DWORD dwAllocationGranularity)
+{
+    ULONG_PTR tryAddr = (ULONG_PTR)pAddress;
+
+    // Round down to the allocation granularity.
+    tryAddr -= tryAddr % dwAllocationGranularity;
+
+    // Start from the next allocation granularity multiply.
+    tryAddr += dwAllocationGranularity;
+
+    while (tryAddr <= (ULONG_PTR)pMaxAddr)
+    {
+        MEMORY_BASIC_INFORMATION mbi;
+        if (VirtualQuery((LPVOID)tryAddr, &mbi, sizeof(mbi)) == 0)
+            break;
+
+        if (mbi.State == MEM_FREE)
+            return (LPVOID)tryAddr;
+
+        tryAddr = (ULONG_PTR)mbi.BaseAddress + mbi.RegionSize;
+
+        // Round up to the next allocation granularity.
+        tryAddr += dwAllocationGranularity - 1;
+        tryAddr -= tryAddr % dwAllocationGranularity;
+    }
+
+    return NULL;
+}
+#endif
+
+//-------------------------------------------------------------------------
+static PMEMORY_BLOCK GetMemoryBlock(LPVOID pOrigin)
+{
+    PMEMORY_BLOCK pBlock;
+#if defined(_M_X64) || defined(__x86_64__)
+    ULONG_PTR minAddr;
+    ULONG_PTR maxAddr;
+
+    SYSTEM_INFO si;
+    GetSystemInfo(&si);
+    minAddr = (ULONG_PTR)si.lpMinimumApplicationAddress;
+    maxAddr = (ULONG_PTR)si.lpMaximumApplicationAddress;
+
+    // pOrigin ± 512MB
+    if ((ULONG_PTR)pOrigin > MAX_MEMORY_RANGE && minAddr < (ULONG_PTR)pOrigin - MAX_MEMORY_RANGE)
+        minAddr = (ULONG_PTR)pOrigin - MAX_MEMORY_RANGE;
+
+    if (maxAddr > (ULONG_PTR)pOrigin + MAX_MEMORY_RANGE)
+        maxAddr = (ULONG_PTR)pOrigin + MAX_MEMORY_RANGE;
+
+    // Make room for MEMORY_BLOCK_SIZE bytes.
+    maxAddr -= MEMORY_BLOCK_SIZE - 1;
+#endif
+
+    // Look the registered blocks for a reachable one.
+    for (pBlock = g_pMemoryBlocks; pBlock != NULL; pBlock = pBlock->pNext)
+    {
+#if defined(_M_X64) || defined(__x86_64__)
+        // Ignore the blocks too far.
+        if ((ULONG_PTR)pBlock < minAddr || (ULONG_PTR)pBlock >= maxAddr)
+            continue;
+#endif
+        // The block has at least one unused slot.
+        if (pBlock->pFree != NULL)
+            return pBlock;
+    }
+
+#if defined(_M_X64) || defined(__x86_64__)
+    // Alloc a new block above if not found.
+    {
+        LPVOID pAlloc = pOrigin;
+        while ((ULONG_PTR)pAlloc >= minAddr)
+        {
+            pAlloc = FindPrevFreeRegion(pAlloc, (LPVOID)minAddr, si.dwAllocationGranularity);
+            if (pAlloc == NULL)
+                break;
+
+            pBlock = (PMEMORY_BLOCK)VirtualAlloc(
+                pAlloc, MEMORY_BLOCK_SIZE, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+            if (pBlock != NULL)
+                break;
+        }
+    }
+
+    // Alloc a new block below if not found.
+    if (pBlock == NULL)
+    {
+        LPVOID pAlloc = pOrigin;
+        while ((ULONG_PTR)pAlloc <= maxAddr)
+        {
+            pAlloc = FindNextFreeRegion(pAlloc, (LPVOID)maxAddr, si.dwAllocationGranularity);
+            if (pAlloc == NULL)
+                break;
+
+            pBlock = (PMEMORY_BLOCK)VirtualAlloc(
+                pAlloc, MEMORY_BLOCK_SIZE, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+            if (pBlock != NULL)
+                break;
+        }
+    }
+#else
+    // In x86 mode, a memory block can be placed anywhere.
+    pBlock = (PMEMORY_BLOCK)VirtualAlloc(
+        NULL, MEMORY_BLOCK_SIZE, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+#endif
+
+    if (pBlock != NULL)
+    {
+        // Build a linked list of all the slots.
+        PMEMORY_SLOT pSlot = (PMEMORY_SLOT)pBlock + 1;
+        pBlock->pFree = NULL;
+        pBlock->usedCount = 0;
+        do
+        {
+            pSlot->pNext = pBlock->pFree;
+            pBlock->pFree = pSlot;
+            pSlot++;
+        } while ((ULONG_PTR)pSlot - (ULONG_PTR)pBlock <= MEMORY_BLOCK_SIZE - MEMORY_SLOT_SIZE);
+
+        pBlock->pNext = g_pMemoryBlocks;
+        g_pMemoryBlocks = pBlock;
+    }
+
+    return pBlock;
+}
+
+//-------------------------------------------------------------------------
+LPVOID AllocateBuffer(LPVOID pOrigin)
+{
+    PMEMORY_SLOT  pSlot;
+    PMEMORY_BLOCK pBlock = GetMemoryBlock(pOrigin);
+    if (pBlock == NULL)
+        return NULL;
+
+    // Remove an unused slot from the list.
+    pSlot = pBlock->pFree;
+    pBlock->pFree = pSlot->pNext;
+    pBlock->usedCount++;
+#ifdef _DEBUG
+    // Fill the slot with INT3 for debugging.
+    memset(pSlot, 0xCC, sizeof(MEMORY_SLOT));
+#endif
+    return pSlot;
+}
+
+//-------------------------------------------------------------------------
+VOID FreeBuffer(LPVOID pBuffer)
+{
+    PMEMORY_BLOCK pBlock = g_pMemoryBlocks;
+    PMEMORY_BLOCK pPrev = NULL;
+    ULONG_PTR pTargetBlock = ((ULONG_PTR)pBuffer / MEMORY_BLOCK_SIZE) * MEMORY_BLOCK_SIZE;
+
+    while (pBlock != NULL)
+    {
+        if ((ULONG_PTR)pBlock == pTargetBlock)
+        {
+            PMEMORY_SLOT pSlot = (PMEMORY_SLOT)pBuffer;
+#ifdef _DEBUG
+            // Clear the released slot for debugging.
+            memset(pSlot, 0x00, sizeof(MEMORY_SLOT));
+#endif
+            // Restore the released slot to the list.
+            pSlot->pNext = pBlock->pFree;
+            pBlock->pFree = pSlot;
+            pBlock->usedCount--;
+
+            // Free if unused.
+            if (pBlock->usedCount == 0)
+            {
+                if (pPrev)
+                    pPrev->pNext = pBlock->pNext;
+                else
+                    g_pMemoryBlocks = pBlock->pNext;
+
+                VirtualFree(pBlock, 0, MEM_RELEASE);
+            }
+
+            break;
+        }
+
+        pPrev = pBlock;
+        pBlock = pBlock->pNext;
+    }
+}
+
+//-------------------------------------------------------------------------
+BOOL IsExecutableAddress(LPVOID pAddress)
+{
+    MEMORY_BASIC_INFORMATION mi;
+    VirtualQuery(pAddress, &mi, sizeof(mi));
+
+    return (mi.State == MEM_COMMIT && (mi.Protect & PAGE_EXECUTE_FLAGS));
+}
